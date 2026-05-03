@@ -1,0 +1,460 @@
+"""
+설문조사 결과 분석 대시보드 — Streamlit 버전
+
+실행 방법:
+  pip install streamlit pandas openpyxl plotly xlsxwriter
+  streamlit run survey_streamlit.py
+"""
+
+import io
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+# ─────────────────────────────────────────────
+# 페이지 설정  ← 반드시 첫 번째 st 호출
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="Survey Analytics",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────────────────────────
+# 디자인 토큰
+# ─────────────────────────────────────────────
+ACCENT  = "#3B82F6"
+TBL_HDR = "#1E3A5F"
+PALETTE = ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6",
+           "#06B6D4","#F97316","#EC4899","#14B8A6","#6366F1"]
+
+# ─────────────────────────────────────────────
+# CSS 주입  ← set_page_config 바로 다음, 다른 st 호출 전
+# ─────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=Noto+Sans+KR:wght@300;400;500;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'DM Sans','Noto Sans KR',sans-serif !important; }
+
+/* 사이드바 다크 테마 */
+[data-testid="stSidebar"] { background:#0F1B2D !important; border-right:1px solid #1E3050; }
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] div { color:#CBD5E1; }
+[data-testid="stSidebar"] label { font-size:11px !important; font-weight:600 !important; color:#64748B !important; text-transform:uppercase; letter-spacing:.07em; }
+[data-testid="stSidebar"] textarea { background:#162030 !important; border:1px solid #243650 !important; color:#CBD5E1 !important; border-radius:6px !important; font-size:12px !important; }
+[data-testid="stSidebar"] [data-baseweb="select"] > div { background:#162030 !important; border-color:#243650 !important; border-radius:6px !important; }
+[data-testid="stSidebar"] input[type="number"] { background:#162030!important; border-color:#243650!important; color:#CBD5E1!important; border-radius:6px!important; }
+[data-testid="stSidebar"] hr { border-color:#1E3050 !important; margin:6px 0 !important; }
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3 { color:#F1F5F9 !important; }
+
+/* 메인 컨테이너 */
+.main .block-container { padding:24px 32px !important; max-width:100% !important; }
+
+/* 탭 스타일 */
+.stTabs [data-baseweb="tab-list"] { border-bottom:2px solid #E5E7EB; gap:2px; }
+.stTabs [data-baseweb="tab"] { font-size:13px !important; font-weight:600 !important; padding:10px 18px !important; border-radius:0 !important; border:none !important; color:#6B7280 !important; background:transparent !important; }
+.stTabs [aria-selected="true"] { color:#3B82F6 !important; border-bottom:2px solid #3B82F6 !important; }
+
+/* 다운로드 버튼 */
+.stDownloadButton > button { border-radius:8px !important; font-size:12px !important; font-weight:600 !important; padding:7px 16px !important; }
+
+/* dataframe 테이블 */
+[data-testid="stDataFrame"] { border-radius:0 0 10px 10px; overflow:hidden; border:1px solid #BFDBFE; border-top:none; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# 유틸 함수
+# ─────────────────────────────────────────────
+def sorted_levels(series):
+    vals = list(series.dropna().astype(str).unique())
+    try:
+        return sorted(vals, key=lambda x: float(x))
+    except Exception:
+        return sorted(vals)
+
+def apply_rename(df, rename_text):
+    if not rename_text:
+        return df
+    df = df.copy()
+    for line in rename_text.strip().splitlines():
+        if "=" in line:
+            old, new = [s.strip() for s in line.split("=", 1)]
+            if old in df.columns:
+                df.rename(columns={old: new}, inplace=True)
+    return df
+
+def apply_labels(df, label_text):
+    if not label_text:
+        return df
+    df = df.copy()
+    for line in label_text.strip().splitlines():
+        if ":" not in line:
+            continue
+        var_name, mappings = [s.strip() for s in line.split(":", 1)]
+        if var_name not in df.columns:
+            continue
+        df[var_name] = df[var_name].astype(str)
+        for pair in mappings.split(","):
+            if "=" in pair:
+                old_v, new_v = [s.strip() for s in pair.split("=", 1)]
+                df[var_name] = df[var_name].replace(old_v, new_v)
+    return df
+
+def fmt(val, mode, dec):
+    return f"{val:.{dec}f}%" if mode == "pct" else f"{val:.{dec}f}"
+
+def build_crosstab(df, t_var, c_vars, mode, dec):
+    if t_var not in df.columns:
+        return None
+    t_levels = sorted_levels(df[t_var])
+    fill = fmt(0, mode, dec)
+
+    def get_vals(sub, level_col):
+        rows = []
+        for lvl in sorted_levels(sub[level_col]):
+            grp = sub[sub[level_col].astype(str) == str(lvl)]
+            total_w = grp["wt"].sum()
+            row = {"구분": f"[{level_col}] {lvl}", "사례수(N)": f"{total_w:.{dec}f}"}
+            for tl in t_levels:
+                w = grp[grp[t_var].astype(str) == str(tl)]["wt"].sum()
+                row[tl] = fmt(w / total_w * 100 if mode == "pct" and total_w > 0 else w, mode, dec)
+            rows.append(row)
+        return rows
+
+    total_w = df["wt"].sum()
+    overall = {"구분": "전체", "사례수(N)": f"{total_w:.{dec}f}"}
+    for tl in t_levels:
+        w = df[df[t_var].astype(str) == str(tl)]["wt"].sum()
+        overall[tl] = fmt(w / total_w * 100 if mode == "pct" and total_w > 0 else w, mode, dec)
+
+    all_rows = [overall]
+    for c_var in c_vars:
+        if c_var in df.columns:
+            all_rows.extend(get_vals(df, c_var))
+
+    return pd.DataFrame(all_rows, columns=["구분", "사례수(N)"] + t_levels).fillna(fill)
+
+def style_crosstab(df):
+    """전체 행 강조 + 헤더 스타일"""
+    def highlight_total(row):
+        if row["구분"] == "전체":
+            return [f"background-color:#EFF6FF; font-weight:700; color:{TBL_HDR}"] * len(row)
+        return [""] * len(row)
+    return (
+        df.style
+        .apply(highlight_total, axis=1)
+        .set_table_styles([
+            {"selector": "thead th", "props": [
+                ("background-color", TBL_HDR), ("color", "white"),
+                ("font-size", "12px"), ("font-weight", "600"),
+                ("text-align", "center"), ("padding", "10px 8px"),
+            ]},
+            {"selector": "td", "props": [
+                ("text-align", "center"), ("font-size", "12.5px"),
+                ("padding", "7px 8px"), ("border-color", "#F3F4F6"),
+            ]},
+            {"selector": "td:first-child", "props": [
+                ("text-align", "left"), ("padding-left", "14px"), ("font-weight", "500"),
+            ]},
+            {"selector": "tr:nth-child(even) td", "props": [("background-color", "#FAFAFA")]},
+            {"selector": "tr:hover td",           "props": [("background-color", "#EFF6FF")]},
+        ])
+        .hide(axis="index")
+    )
+
+def to_excel_bytes(all_tables):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        wb = writer.book
+        hdr_fmt   = wb.add_format({"bold": True, "bg_color": TBL_HDR, "font_color": "white",
+                                    "align": "center", "border": 1, "font_size": 11})
+        total_fmt = wb.add_format({"bold": True, "bg_color": "#EFF6FF", "font_color": TBL_HDR,
+                                    "align": "center", "border": 1, "font_size": 11})
+        for t_var, df in all_tables.items():
+            sheet = str(t_var)[:31]
+            df.to_excel(writer, index=False, sheet_name=sheet)
+            ws = writer.sheets[sheet]
+            for c, col in enumerate(df.columns):
+                ws.write(0, c, col, hdr_fmt)
+            for r, row in enumerate(df.itertuples(index=False), 1):
+                if str(row[0]) == "전체":
+                    for c, val in enumerate(row):
+                        ws.write(r, c, val, total_fmt)
+            ws.set_column(0, 0, 30)
+            ws.set_column(1, len(df.columns) - 1, 12)
+            ws.freeze_panes(1, 0)
+    buf.seek(0)
+    return buf.read()
+
+def to_csv_bytes(all_tables):
+    parts = []
+    for t_var, df in all_tables.items():
+        sep = pd.DataFrame([["▶ " + t_var] + [""] * (len(df.columns) - 1)], columns=df.columns)
+        parts.extend([sep, df])
+    return pd.concat(parts, ignore_index=True).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+def build_chart(df, t_var, p_group, dec):
+    t_levels = sorted_levels(df[t_var])
+    base = dict(
+        paper_bgcolor="white", plot_bgcolor="white",
+        font=dict(family="DM Sans, Noto Sans KR, sans-serif", size=12, color="#111827"),
+        margin=dict(l=60, r=30, t=55, b=60),
+        hoverlabel=dict(bgcolor="white", bordercolor="#E5E7EB", font=dict(size=12)),
+    )
+
+    # 전체 단순 막대
+    if p_group == "전체":
+        grp = df[df[t_var].notna()].groupby(df[t_var].astype(str))["wt"].sum().reset_index()
+        grp.columns = [t_var, "w_n"]
+        grp["pct"] = grp["w_n"] / grp["w_n"].sum() * 100
+        grp = grp.set_index(t_var).reindex(t_levels).reset_index()
+        fig = go.Figure()
+        for i, row in grp.iterrows():
+            fig.add_trace(go.Bar(
+                x=[row[t_var]], y=[row["pct"]],
+                marker=dict(color=PALETTE[i % len(PALETTE)], line=dict(width=0)),
+                text=[f"<b>{row['pct']:.{dec}f}%</b>"], textposition="outside",
+                hovertemplate=f"<b>{row[t_var]}</b><br>{row['pct']:.{dec}f}%<extra></extra>",
+                showlegend=False, width=0.5,
+            ))
+        fig.update_layout(
+            **base,
+            title=dict(text=f"<b>{t_var}</b>  전체 응답 비율",
+                       font=dict(size=14, color=TBL_HDR), x=0, xanchor="left"),
+            xaxis=dict(title=None, showgrid=False, zeroline=False),
+            yaxis=dict(title="비율 (%)", showgrid=True, gridcolor="#F3F4F6", zeroline=False,
+                       range=[0, (grp["pct"].max() if not grp.empty else 100) * 1.2]),
+            bargap=0.4,
+        )
+        return fig
+
+    # 교차 누적 가로 막대
+    if p_group not in df.columns:
+        return None
+    p_levels = sorted_levels(df[p_group])
+    sub = df[df[t_var].notna() & df[p_group].notna()].copy()
+    sub[t_var]   = sub[t_var].astype(str)
+    sub[p_group] = sub[p_group].astype(str)
+    grp = sub.groupby([p_group, t_var])["wt"].sum().reset_index()
+    grp.columns = [p_group, t_var, "w_n"]
+    totals = grp.groupby(p_group)["w_n"].sum().reset_index().rename(columns={"w_n": "total"})
+    grp = grp.merge(totals, on=p_group)
+    grp["pct"] = grp["w_n"] / grp["total"] * 100
+    fig = go.Figure()
+    for i, tl in enumerate(t_levels):
+        sub_tl = grp[grp[t_var] == str(tl)].set_index(p_group).reindex(p_levels)
+        vals = sub_tl["pct"].fillna(0).values
+        fig.add_trace(go.Bar(
+            y=p_levels, x=vals, name=str(tl), orientation="h",
+            marker=dict(color=PALETTE[i % len(PALETTE)], line=dict(width=0)),
+            text=[f"<b>{v:.{dec}f}%</b>" if v > 4 else "" for v in vals],
+            textposition="inside", insidetextanchor="middle",
+            hovertemplate=f"<b>{tl}</b><br>%{{y}}: %{{x:.{dec}f}}%<extra></extra>",
+        ))
+    fig.update_layout(
+        **base, barmode="stack",
+        title=dict(text=f"<b>{p_group}</b> 특성별  <b>{t_var}</b>  응답 분포",
+                   font=dict(size=14, color=TBL_HDR), x=0, xanchor="left"),
+        xaxis=dict(title="비율 (%)", range=[0, 100], showgrid=True,
+                   gridcolor="#F3F4F6", zeroline=False, ticksuffix="%"),
+        yaxis=dict(title=None, showgrid=False, zeroline=False),
+        legend=dict(title=dict(text=t_var), orientation="h",
+                    yanchor="bottom", y=-0.22, xanchor="left", x=0,
+                    font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
+        bargap=0.25,
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────
+# 사이드바 — st.* 위젯으로만 구성 (HTML 클래스 의존 제거)
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 📊 Survey Analytics")
+    st.caption("결과 분석 대시보드 · Cross-tab & Visualization")
+    st.divider()
+
+    # 1. 파일 업로드
+    st.markdown("**☁ 데이터 업로드**")
+    uploaded = st.file_uploader("Excel 파일 선택 (.xlsx / .xls)",
+                                type=["xlsx", "xls"],
+                                label_visibility="collapsed")
+    st.divider()
+
+    # 2. 변수명 변경
+    st.markdown("**✏ 변수명 변경**")
+    rename_text = st.text_area(
+        "기존변수=새변수 (줄바꿈)",
+        placeholder="SQ1=지역\nSQ2=연령대",
+        height=88,
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    # 3. 라벨링
+    st.markdown("**🏷 값 라벨링**")
+    label_text = st.text_area(
+        "변수명: 1=값A, 2=값B",
+        placeholder="성별: 1=남자, 2=여자\n지역: 1=서울, 2=경기",
+        height=110,
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    # 4. 가중치 & 필터 (파일 로드 후 활성화)
+    st.markdown("**⚖ 가중치 & 필터**")
+    weight_var  = "(가중치 없음)"
+    filter_var  = "(선택 안 함)"
+    filter_vals = []
+
+    if uploaded:
+        _raw = pd.read_excel(uploaded)
+        _raw = apply_rename(_raw, rename_text)
+        _raw = apply_labels(_raw, label_text)
+        _cols = _raw.columns.tolist()
+
+        weight_var = st.selectbox("가중치 변수", ["(가중치 없음)"] + _cols)
+        filter_var = st.selectbox("필터 변수",   ["(선택 안 함)"]  + _cols)
+        if filter_var != "(선택 안 함)":
+            _choices    = sorted_levels(_raw[filter_var])
+            filter_vals = st.multiselect(
+                f"'{filter_var}' 포함 값", _choices, default=_choices)
+    else:
+        st.caption("파일을 업로드하면\n변수 목록이 표시됩니다.")
+
+    st.divider()
+
+    # 5. 출력 설정
+    st.markdown("**⚙ 출력 설정**")
+    display_mode = st.radio("표시 방식", ["비율 (%)", "사례수 (N)"], horizontal=True)
+    mode = "pct" if "비율" in display_mode else "count"
+    dec  = int(st.number_input("소수점 자리수", min_value=0, max_value=5, value=1, step=1))
+
+
+# ─────────────────────────────────────────────
+# 메인 영역
+# ─────────────────────────────────────────────
+
+# 페이지 제목 (st.* 로 렌더링 — HTML 클래스 불필요)
+st.markdown("### 분석 워크스페이스")
+st.caption("교차분석표 & 시각화")
+
+# ── 파일 미업로드
+if not uploaded:
+    st.info("👈 좌측 사이드바에서 Excel 파일을 업로드하면 분석을 시작할 수 있습니다.")
+    st.stop()
+
+# ── 데이터 전처리
+df = _raw.copy()
+if filter_var != "(선택 안 함)" and filter_vals and filter_var in df.columns:
+    df = df[df[filter_var].astype(str).isin([str(v) for v in filter_vals])]
+df["wt"] = (
+    pd.to_numeric(df[weight_var], errors="coerce").fillna(0)
+    if weight_var != "(가중치 없음)" and weight_var in df.columns
+    else 1.0
+)
+cols = df.columns.tolist()
+
+# ── 변수 설정 패널
+with st.container(border=True):
+    st.caption("🔲 분석 변수 설정")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("🔵 **COL** — 가로(Column) 변수 · 주요 분석 문항")
+        target_vars = st.multiselect(
+            "target", cols, placeholder="분석 문항 선택 (다중)...",
+            label_visibility="collapsed")
+    with c2:
+        st.markdown("🟣 **ROW** — 세로(Row) 변수 · 집단 특성 문항")
+        cross_vars = st.multiselect(
+            "cross", cols, placeholder="집단 변수 선택 (다중)...",
+            label_visibility="collapsed")
+
+# ── 선택 미완료
+if not target_vars or not cross_vars:
+    st.info("📊 가로(COL) 변수와 세로(ROW) 변수를 각각 하나 이상 선택하면 교차 분석표가 생성됩니다.")
+    st.stop()
+
+# ── 교차표 생성
+all_tables = {}
+for t_var in target_vars:
+    result = build_crosstab(df, t_var, cross_vars, mode, dec)
+    if result is not None:
+        all_tables[t_var] = result
+
+# ─────────────────────────────────────────────
+# 탭
+# ─────────────────────────────────────────────
+tab_table, tab_chart = st.tabs(["📋  데이터 테이블", "📈  시각화"])
+
+# ── 탭 1: 교차 분석표
+with tab_table:
+    col_xl, col_csv, col_note = st.columns([1, 1, 6])
+    with col_xl:
+        st.download_button(
+            "📥 Excel",
+            data=to_excel_bytes(all_tables),
+            file_name="교차분석표.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col_csv:
+        st.download_button(
+            "📋 CSV",
+            data=to_csv_bytes(all_tables),
+            file_name="교차분석표.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with col_note:
+        st.caption("문항별 시트/구분행으로 내보내기")
+
+    for i, (t_var, result) in enumerate(all_tables.items(), 1):
+        # 카드 헤더 — inline style로 렌더링 (외부 클래스 불필요)
+        st.markdown(f"""
+        <div style="
+            background:linear-gradient(135deg,#EFF6FF 0%,#F0F9FF 100%);
+            border:1px solid #BFDBFE;
+            border-radius:10px 10px 0 0;
+            padding:12px 18px;
+            display:flex;
+            align-items:center;
+            gap:10px;
+            margin-top:20px;
+        ">
+            <span style="
+                background:#3B82F6;color:white;font-size:11px;font-weight:800;
+                width:24px;height:24px;border-radius:6px;
+                display:inline-flex;align-items:center;justify-content:center;
+            ">{i}</span>
+            <span style="font-size:14px;font-weight:700;color:#1E3A5F;">{t_var}</span>
+        </div>
+        """, unsafe_allow_html=True)
+        st.dataframe(style_crosstab(result), use_container_width=True, hide_index=True)
+
+# ── 탭 2: 시각화
+with tab_chart:
+    vc1, vc2, vc3 = st.columns([2, 2, 3])
+    with vc1:
+        plot_tvar = st.selectbox("시각화 문항", target_vars)
+    with vc2:
+        plot_group = st.selectbox("그룹 기준", ["전체"] + cross_vars)
+    with vc3:
+        st.caption(" ")
+        st.caption("ℹ 1번 응답이 왼쪽/위부터 배치됩니다.")
+
+    if plot_tvar:
+        fig = build_chart(df, plot_tvar, plot_group, dec)
+        if fig:
+            st.plotly_chart(
+                fig, use_container_width=True,
+                config={"displaylogo": False,
+                        "modeBarButtonsToRemove": ["select2d", "lasso2d"]},
+            )
+        else:
+            st.warning("선택한 그룹 변수가 데이터에 없습니다.")
