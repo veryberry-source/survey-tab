@@ -108,77 +108,34 @@ def apply_labels(df, label_text):
 def fmt(val, mode, dec):
     return f"{val:.{dec}f}%" if mode == "pct" else f"{val:.{dec}f}"
 
-def build_crosstab(df, t_var, c_vars, mode, dec, pct_base="행 기준"):
-    """
-    pct_base:
-      행 기준  — 각 집단(행) 내 유효 응답 합계를 분모
-      열 기준  — 같은 c_var 블록 안에서 각 열(t_var 값)의 합 = 100%
-      전체 기준 — 전체 유효 응답자 합계를 분모
-    결측(NaN, 빈 문자열)은 모든 기준에서 분모·분자 모두 제외
-    """
+def build_crosstab(df, t_var, c_vars, mode, dec):
     if t_var not in df.columns:
         return None
+    t_levels = sorted_levels(df[t_var])
+    fill = fmt(0, mode, dec)
 
-    # t_var 결측 제외
-    valid_mask = df[t_var].notna() & (df[t_var].astype(str).str.strip() != "")
-    df_valid   = df[valid_mask].copy()
+    def get_vals(sub, level_col):
+        rows = []
+        for lvl in sorted_levels(sub[level_col]):
+            grp = sub[sub[level_col].astype(str) == str(lvl)]
+            total_w = grp["wt"].sum()
+            row = {"구분": f"[{level_col}] {lvl}", "사례수(N)": f"{total_w:.{dec}f}"}
+            for tl in t_levels:
+                w = grp[grp[t_var].astype(str) == str(tl)]["wt"].sum()
+                row[tl] = fmt(w / total_w * 100 if mode == "pct" and total_w > 0 else w, mode, dec)
+            rows.append(row)
+        return rows
 
-    t_levels    = sorted_levels(df_valid[t_var])
-    fill        = fmt(0, mode, dec)
-    grand_total = df_valid["wt"].sum()
+    total_w = df["wt"].sum()
+    overall = {"구분": "전체", "사례수(N)": f"{total_w:.{dec}f}"}
+    for tl in t_levels:
+        w = df[df[t_var].astype(str) == str(tl)]["wt"].sum()
+        overall[tl] = fmt(w / total_w * 100 if mode == "pct" and total_w > 0 else w, mode, dec)
 
-    def calc(w, denom):
-        """공통 계산: w/denom*100 or w"""
-        if mode != "pct":
-            return fmt(w, mode, dec)
-        return fmt(w / denom * 100 if denom > 0 else 0, mode, dec)
-
-    def make_row(label, grp, col_totals_local, grand_local):
-        """
-        grp           : 해당 행(집단 or 전체)의 유효 응답 df
-        col_totals_local : 열 기준용 — 같은 블록(c_var 전체) 내 각 tl의 가중치 합
-        grand_local   : 전체 기준용 분모
-        """
-        row_total = grp["wt"].sum()
-        row = {"구분": label, "사례수(N)": f"{row_total:.{dec}f}"}
-        for tl in t_levels:
-            w = grp[grp[t_var].astype(str) == str(tl)]["wt"].sum()
-            if pct_base == "행 기준":
-                row[tl] = calc(w, row_total)
-            elif pct_base == "열 기준":
-                row[tl] = calc(w, col_totals_local.get(tl, 0))
-            else:  # 전체 기준
-                row[tl] = calc(w, grand_local)
-        return row
-
-    # ── 전체 행
-    # 열 기준 전체: df_valid 전체 기준 col_totals
-    col_totals_all = {
-        tl: df_valid[df_valid[t_var].astype(str) == str(tl)]["wt"].sum()
-        for tl in t_levels
-    }
-    all_rows = [make_row("전체", df_valid, col_totals_all, grand_total)]
-
-    # ── c_var 블록별 행
+    all_rows = [overall]
     for c_var in c_vars:
-        if c_var not in df_valid.columns:
-            continue
-        # c_var 결측 제외
-        block = df_valid[
-            df_valid[c_var].notna() & (df_valid[c_var].astype(str).str.strip() != "")
-        ]
-        # 열 기준: 이 블록(c_var 유효 전체) 안에서의 열 합계를 분모로 사용
-        # → 블록 내 모든 집단 행을 합치면 각 열이 100%가 됨
-        col_totals_block = {
-            tl: block[block[t_var].astype(str) == str(tl)]["wt"].sum()
-            for tl in t_levels
-        }
-        grand_block = block["wt"].sum()
-
-        for lvl in sorted_levels(block[c_var]):
-            grp = block[block[c_var].astype(str) == str(lvl)]
-            label = f"[{c_var}] {lvl}"
-            all_rows.append(make_row(label, grp, col_totals_block, grand_block))
+        if c_var in df.columns:
+            all_rows.extend(get_vals(df, c_var))
 
     return pd.DataFrame(all_rows, columns=["구분", "사례수(N)"] + t_levels).fillna(fill)
 
@@ -376,19 +333,7 @@ with st.sidebar:
     st.markdown("**⚙ 출력 설정**")
     display_mode = st.radio("표시 방식", ["비율 (%)", "사례수 (N)"], horizontal=True)
     mode = "pct" if "비율" in display_mode else "count"
-    if mode == "pct":
-        pct_base = st.radio(
-            "비율 기준",
-            ["행 기준", "열 기준", "전체 기준"],
-            help=(
-                "행 기준: 각 집단(행) 합계 = 100%  ← 기본\n"
-                "열 기준: 각 응답(열) 합계 = 100%\n"
-                "전체 기준: 전체 응답자 합계 = 100%"
-            ),
-        )
-    else:
-        pct_base = "행 기준"
-    dec = int(st.number_input("소수점 자리수", min_value=0, max_value=5, value=1, step=1))
+    dec  = int(st.number_input("소수점 자리수", min_value=0, max_value=5, value=1, step=1))
 
 
 # ─────────────────────────────────────────────
@@ -438,7 +383,7 @@ if not target_vars or not cross_vars:
 # ── 교차표 생성
 all_tables = {}
 for t_var in target_vars:
-    result = build_crosstab(df, t_var, cross_vars, mode, dec, pct_base)
+    result = build_crosstab(df, t_var, cross_vars, mode, dec)
     if result is not None:
         all_tables[t_var] = result
 
