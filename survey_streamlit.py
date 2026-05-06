@@ -413,7 +413,8 @@ df["wt"] = (
     if weight_var != "(가중치 없음)" and weight_var in df.columns
     else 1.0
 )
-cols = df.columns.tolist()
+# wt 컬럼 추가 이전 원본 컬럼만 사용 (wt 제외)
+cols = [c for c in _raw.columns.tolist() if c != "wt"]
 
 # ── 변수 설정 패널
 with st.container(border=True):
