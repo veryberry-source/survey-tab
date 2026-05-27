@@ -105,8 +105,52 @@ def apply_labels(df, label_text):
                 df[var_name] = df[var_name].replace(old_v, new_v)
     return df
 
+def read_uploaded_file(uploaded):
+    """xlsx / xls / csv 자동 판별 읽기, CSV 인코딩 자동 감지"""
+    name = uploaded.name.lower()
+    if name.endswith(".csv"):
+        raw = uploaded.read()
+        for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+            try:
+                return pd.read_csv(io.BytesIO(raw), encoding=enc)
+            except Exception:
+                continue
+        raise ValueError("CSV 인코딩을 인식할 수 없습니다.")
+    else:
+        return pd.read_excel(uploaded)
+
 def fmt(val, mode, dec):
     return f"{val:.{dec}f}%" if mode == "pct" else f"{val:.{dec}f}"
+
+def apply_combine(df, combine_text):
+    """
+    변수 결합 생성. 형식 (줄바꿈으로 여러 개):
+      새변수명 = 변수A * 변수B
+      성by연령 = 성별 * 연령대
+    결합 값은 "값A_값B" 형태로 생성
+    """
+    if not combine_text:
+        return df
+    df = df.copy()
+    for line in combine_text.strip().splitlines():
+        line = line.strip()
+        if not line or "=" not in line or "*" not in line:
+            continue
+        new_var, expr = [s.strip() for s in line.split("=", 1)]
+        parts = [s.strip() for s in expr.split("*")]
+        if not new_var or len(parts) < 2:
+            continue
+        missing = [p for p in parts if p not in df.columns]
+        if missing:
+            continue
+        df[new_var] = df[parts[0]].astype(str)
+        for p in parts[1:]:
+            df[new_var] = df[new_var] + "_" + df[p].astype(str)
+        # 결측이 포함된 행은 결합 결과도 결측 처리
+        for p in parts:
+            mask = df[p].isna() | (df[p].astype(str).str.strip() == "")
+            df.loc[mask, new_var] = None
+    return df
 
 def build_crosstab(df, t_var, c_vars, mode, dec, pct_base="행 기준"):
     """
@@ -324,8 +368,8 @@ with st.sidebar:
 
     # 1. 파일 업로드
     st.markdown("**☁ 데이터 업로드**")
-    uploaded = st.file_uploader("Excel 파일 선택 (.xlsx / .xls)",
-                                type=["xlsx", "xls"],
+    uploaded = st.file_uploader("Excel / CSV 파일 선택",
+                                type=["xlsx", "xls", "csv"],
                                 label_visibility="collapsed")
     st.divider()
 
@@ -349,16 +393,32 @@ with st.sidebar:
     )
     st.divider()
 
-    # 4. 가중치 & 필터 (파일 로드 후 활성화)
+    # 4. 변수 결합
+    st.markdown("**🔗 변수 결합**")
+    show_combine = st.toggle("변수 결합 사용", value=False)
+    if show_combine:
+        combine_text = st.text_area(
+            "새변수명 = 변수A * 변수B",
+            placeholder="성by연령 = 성별 * 연령대\n지역by성별 = 지역 * 성별",
+            height=100,
+            label_visibility="collapsed",
+            help="* 로 결합할 변수를 구분합니다. 결합된 변수는 분석 변수 목록에 자동 추가됩니다.",
+        )
+    else:
+        combine_text = ""
+    st.divider()
+
+    # 5. 가중치 & 필터 (파일 로드 후 활성화)
     st.markdown("**⚖ 가중치 & 필터**")
     weight_var  = "(가중치 없음)"
     filter_var  = "(선택 안 함)"
     filter_vals = []
 
     if uploaded:
-        _raw = pd.read_excel(uploaded)
+        _raw = read_uploaded_file(uploaded)
         _raw = apply_rename(_raw, rename_text)
         _raw = apply_labels(_raw, label_text)
+        _raw = apply_combine(_raw, combine_text)
         _cols = _raw.columns.tolist()
 
         weight_var = st.selectbox("가중치 변수", ["(가중치 없음)"] + _cols)
@@ -372,7 +432,7 @@ with st.sidebar:
 
     st.divider()
 
-    # 5. 출력 설정
+    # 6. 출력 설정
     st.markdown("**⚙ 출력 설정**")
     display_mode = st.radio("표시 방식", ["비율 (%)", "사례수 (N)"], horizontal=True)
     mode = "pct" if "비율" in display_mode else "count"
